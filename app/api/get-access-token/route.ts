@@ -3,29 +3,44 @@ const HEYGEN_API_KEY = process.env.HEYGEN_API_KEY;
 export async function POST() {
   try {
     if (!HEYGEN_API_KEY) {
-      throw new Error("API key is missing from .env");
+      return new Response(
+        JSON.stringify({ error: "API key is missing from .env" }),
+        { status: 500 }
+      );
     }
-    const baseApiUrl = process.env.NEXT_PUBLIC_BASE_API_URL;
 
-    const res = await fetch(`${baseApiUrl}/v1/streaming.create_token`, {
+    const res = await fetch("https://api.heygen.com/v1/streaming.create_token", {
       method: "POST",
       headers: {
         "x-api-key": HEYGEN_API_KEY,
+        "Content-Type": "application/json",
       },
     });
 
-    console.log("Response:", res);
+    if (!res.ok) {
+      const txt = await res.text();
+      return new Response(
+        JSON.stringify({ error: "Heygen error", detail: txt }),
+        { status: res.status }
+      );
+    }
 
     const data = await res.json();
 
-    return new Response(data.data.token, {
-      status: 200,
-    });
-  } catch (error) {
+    // O Heygen devolve { data: { token, rtcToken, wsUrl } }
+    // Temos de devolver o objeto todo, não só a string
+    return new Response(
+      JSON.stringify({
+        rtcToken: data.data?.rtcToken || data.data?.token,
+        wsUrl: data.data?.wsUrl,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  } catch (error: any) {
     console.error("Error retrieving access token:", error);
-
-    return new Response("Failed to retrieve access token", {
-      status: 500,
-    });
+    return new Response(
+      JSON.stringify({ error: "Failed to retrieve access token" }),
+      { status: 500 }
+    );
   }
 }
