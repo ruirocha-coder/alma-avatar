@@ -27,14 +27,13 @@ import { AVATARS } from "@/app/lib/constants";
 const DEFAULT_CONFIG: StartAvatarRequest = {
   quality: AvatarQuality.Low,
   avatarName: AVATARS[0].avatar_id,
-  knowledgeId: undefined,
+  knowledgeId: undefined, // <- deixa undefined para não usar o LLM deles
   voice: {
     rate: 1.5,
     emotion: VoiceEmotion.EXCITED,
     model: ElevenLabsModel.eleven_flash_v2_5,
   },
-  // mantemos o default; podes mudar no .env com NEXT_PUBLIC_HEYGEN_LANGUAGE
-  language: (process.env.NEXT_PUBLIC_HEYGEN_LANGUAGE as any) || "en",
+  language: "en",
   voiceChatTransport: VoiceChatTransport.WEBSOCKET,
   sttSettings: {
     provider: STTProvider.DEEPGRAM,
@@ -47,109 +46,72 @@ function InteractiveAvatar() {
   const { startVoiceChat } = useVoiceChat();
 
   const [config, setConfig] = useState<StartAvatarRequest>(DEFAULT_CONFIG);
-
   const mediaStream = useRef<HTMLVideoElement>(null);
 
+  // === pega token da tua API ===
   async function fetchAccessToken() {
-    try {
-      const response = await fetch("/api/get-access-token", {
-        method: "POST",
-      });
-      const token = await response.text();
-
-      console.log("Access Token:", token);
-      return token;
-    } catch (error) {
-      console.error("Error fetching access token:", error);
-      throw error;
-    }
+    const response = await fetch("/api/get-access-token", { method: "POST" });
+    if (!response.ok) throw new Error("Falha a obter access token");
+    const token = await response.text();
+    return token;
   }
 
-  // --- 👇 ADIÇÃO: extrair texto do evento do utilizador
-  function extractUserText(event: any): string {
-    return (
-      event?.detail?.text ||
-      event?.detail?.finalText ||
-      event?.detail?.message ||
-      ""
-    );
-  }
-
-  // --- 👇 ADIÇÃO: pedir resposta ao teu backend Alma (Grok)
-  async function askAlma(question: string): Promise<string> {
-    try {
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-      });
-      const j = await r.json();
-      return j?.answer || "Não consegui obter resposta.";
-    } catch (e) {
-      console.error("Erro a chamar /api/alma:", e);
-      return "Ocorreu um erro ao contactar a Alma.";
-    }
-  }
-
+  // === arranque de sessão (voz ou texto) ===
   const startSessionV2 = useMemoizedFn(async (isVoiceChat: boolean) => {
     try {
       const newToken = await fetchAccessToken();
       const avatar = initAvatar(newToken);
 
-      avatar.on(StreamingEvents.AVATAR_START_TALKING, (e: any) => {
+      // logs úteis
+      avatar.on(StreamingEvents.AVATAR_START_TALKING, (e) => {
         console.log("Avatar started talking", e);
       });
-      avatar.on(StreamingEvents.AVATAR_STOP_TALKING, (e: any) => {
+      avatar.on(StreamingEvents.AVATAR_STOP_TALKING, (e) => {
         console.log("Avatar stopped talking", e);
       });
       avatar.on(StreamingEvents.STREAM_DISCONNECTED, () => {
         console.log("Stream disconnected");
       });
-      avatar.on(StreamingEvents.STREAM_READY, (event: any) => {
+      avatar.on(StreamingEvents.STREAM_READY, (event) => {
         console.log(">>>>> Stream ready:", event.detail);
       });
-      avatar.on(StreamingEvents.USER_START, (event: any) => {
+      avatar.on(StreamingEvents.USER_START, (event) => {
         console.log(">>>>> User started talking:", event);
       });
-      avatar.on(StreamingEvents.USER_STOP, (event: any) => {
+      avatar.on(StreamingEvents.USER_STOP, (event) => {
         console.log(">>>>> User stopped talking:", event);
       });
-
-      // --- 👇 ADIÇÃO: quando o user termina a fala → vai ao Alma → avatar fala a resposta
-      avatar.on(StreamingEvents.USER_END_MESSAGE, async (event: any) => {
-        console.log(">>>>> User end message:", event);
-
-        const text = extractUserText(event).trim();
-        if (!text) return;
-
-        // (Opcional) interromper fala corrente se o SDK tiver método
-        if ((avatar as any)?.interrupt) {
-          try {
-            await (avatar as any).interrupt();
-          } catch {
-            /* silencioso */
-          }
-        }
-
-        const answer = await askAlma(text);
-        console.log("🤖 Alma:", answer);
-
-        try {
-          // Falar com TTS do HeyGen (sem opções extra para evitar erros de tipos)
-          await (avatar as any).speak({ text: answer });
-        } catch (e) {
-          console.error("Erro no avatar.speak:", e);
-        }
-      });
-
-      avatar.on(StreamingEvents.USER_TALKING_MESSAGE, (event: any) => {
+      avatar.on(StreamingEvents.USER_TALKING_MESSAGE, (event) => {
         console.log(">>>>> User talking message:", event);
       });
-      avatar.on(StreamingEvents.AVATAR_TALKING_MESSAGE, (event: any) => {
+      avatar.on(StreamingEvents.AVATAR_TALKING_MESSAGE, (event) => {
         console.log(">>>>> Avatar talking message:", event);
       });
-      avatar.on(StreamingEvents.AVATAR_END_MESSAGE, (event: any) => {
+      avatar.on(StreamingEvents.AVATAR_END_MESSAGE, (event) => {
         console.log(">>>>> Avatar end message:", event);
+      });
+
+      // === AQUI ESTÁ A PONTE PARA O GROK ===
+      avatar.on(StreamingEvents.USER_END_MESSAGE, async (ev: any) => {
+        try {
+          const transcript =
+            ev?.detail?.text || ev?.text || ev?.message || "".trim();
+          if (!transcript) return;
+
+          // chama o teu endpoint Grok
+          const r = await fetch("/api/alma", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question: transcript }),
+          });
+          const j = await r.json();
+          const answer = (j?.answer || "").trim() || "Não consegui obter resposta.";
+
+          // fala a resposta (sem forçar voiceId/language para respeitar o UI)
+          await avatar.speak({ text: answer });
+        } catch (e) {
+          console.error("Falha na ponte Grok → Avatar:", e);
+        }
       });
 
       await startAvatar(config);
@@ -190,21 +152,15 @@ function InteractiveAvatar() {
             <AvatarControls />
           ) : sessionState === StreamingAvatarSessionState.INACTIVE ? (
             <div className="flex flex-row gap-4">
-              <Button onClick={() => startSessionV2(true)}>
-                Start Voice Chat
-              </Button>
-              <Button onClick={() => startSessionV2(false)}>
-                Start Text Chat
-              </Button>
+              <Button onClick={() => startSessionV2(true)}>Start Voice Chat</Button>
+              <Button onClick={() => startSessionV2(false)}>Start Text Chat</Button>
             </div>
           ) : (
             <LoadingIcon />
           )}
         </div>
       </div>
-      {sessionState === StreamingAvatarSessionState.CONNECTED && (
-        <MessageHistory />
-      )}
+      {sessionState === StreamingAvatarSessionState.CONNECTED && <MessageHistory />}
     </div>
   );
 }
