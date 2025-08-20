@@ -20,21 +20,21 @@ import { AvatarControls } from "./AvatarSession/AvatarControls";
 import { useVoiceChat } from "./logic/useVoiceChat";
 import { StreamingAvatarProvider, StreamingAvatarSessionState } from "./logic";
 import { LoadingIcon } from "./Icons";
-import { MessageHistory } from "./AvatarSession/MessageHistory";
+import { MessageHistory, useMessageHistory } from "./AvatarSession/MessageHistory";
 
 import { AVATARS } from "@/app/lib/constants";
 
-// ⚠️ Deixa knowledgeId = undefined (sem agent/knowledge) para impedir LLM interno
 const DEFAULT_CONFIG: StartAvatarRequest = {
   quality: AvatarQuality.Low,
   avatarName: AVATARS[0].avatar_id,
   knowledgeId: undefined,
+  agent: undefined, // 👈 força a não usar o LLM interno do HeyGen
   voice: {
-    rate: 1.5,
+    rate: 1.2,
     emotion: VoiceEmotion.EXCITED,
     model: ElevenLabsModel.eleven_flash_v2_5,
   },
-  language: "en", // não mexemos para evitar side-effects no STT; o texto do Grok sai em PT
+  language: "en",
   voiceChatTransport: VoiceChatTransport.WEBSOCKET,
   sttSettings: {
     provider: STTProvider.DEEPGRAM,
@@ -45,105 +45,59 @@ function InteractiveAvatar() {
   const { initAvatar, startAvatar, stopAvatar, sessionState, stream } =
     useStreamingAvatarSession();
   const { startVoiceChat } = useVoiceChat();
+  const { addMessage } = useMessageHistory();
 
   const [config, setConfig] = useState<StartAvatarRequest>(DEFAULT_CONFIG);
 
   const mediaStream = useRef<HTMLVideoElement>(null);
-  const userBufferRef = useRef<string>(""); // onde acumulamos o que o utilizador disse
+  const avatarRef = useRef<any>(null);
 
   async function fetchAccessToken() {
     const response = await fetch("/api/get-access-token", { method: "POST" });
-    if (!response.ok) throw new Error("Falha ao obter access token");
-    const token = await response.text();
-    return token;
-  }
-
-  // chama o teu Alma Server (Next route em /api/alma)
-  async function askAlma(question: string): Promise<string> {
-    try {
-      const r = await fetch("/api/alma", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
-      });
-      if (!r.ok) {
-        const txt = await r.text();
-        console.error("Erro /api/alma:", txt);
-        return "Não consegui obter resposta do Alma Server.";
-      }
-      const j = await r.json();
-      return j.answer || "Sem resposta do Alma.";
-    } catch (e: any) {
-      console.error("Exceção /api/alma:", e?.message || e);
-      return "Erro a contactar o Alma Server.";
-    }
+    return await response.text();
   }
 
   const startSessionV2 = useMemoizedFn(async (isVoiceChat: boolean) => {
     try {
-      const token = await fetchAccessToken();
-      const avatar = initAvatar(token);
+      const newToken = await fetchAccessToken();
+      const avatar = initAvatar(newToken);
+      avatarRef.current = avatar;
 
-      // —— EVENTOS: só ouvimos o UTILIZADOR e respondemos com o Grok ——
-      // (1) Quando o stream ficar pronto, tentamos interromper qualquer greeting interno
-      avatar.on(StreamingEvents.STREAM_READY, async () => {
-        try {
-          if ((avatar as any)?.interrupt) {
-            await (avatar as any).interrupt();
-          }
-        } catch {}
+      avatar.on(StreamingEvents.STREAM_READY, () => {
+        console.log("✅ Stream ready");
+        avatar.interrupt(); // corta greeting automático
       });
 
-      // (2) Mensagens parciais do utilizador enquanto fala → acumulamos
-      avatar.on(StreamingEvents.USER_TALKING_MESSAGE, (event: any) => {
-        const partial =
-          event?.detail?.text ??
-          event?.detail?.message ??
-          event?.text ??
-          "";
-        if (partial) userBufferRef.current = partial;
-      });
+      avatar.on(StreamingEvents.USER_END_MESSAGE, async (event) => {
+        const userMsg = event.detail?.text;
+        if (!userMsg) return;
 
-      // (3) Utilizador terminou a fala → perguntamos ao Alma e o avatar fala a resposta
-      avatar.on(StreamingEvents.USER_END_MESSAGE, async (event: any) => {
-        // tenta usar texto final do evento; se não houver, usa o buffer
-        const finalText =
-          event?.detail?.text ??
-          event?.detail?.message ??
-          event?.text ??
-          userBufferRef.current ??
-          "";
-
-        userBufferRef.current = "";
-
-        const question = (finalText || "").trim();
-        if (!question) return;
-
-        const answer = await askAlma(question);
+        // Adiciona a fala do utilizador no histórico
+        addMessage("YOU", userMsg);
 
         try {
-          // interrompe qualquer áudio pendente
-          if ((avatar as any)?.interrupt) {
-            await (avatar as any).interrupt();
-          }
-          // fala APENAS o texto do Grok (Alma Server)
-          await (avatar as any).speak({ text: answer });
+          const r = await fetch("/api/alma", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question: userMsg }),
+          });
+
+          const j = await r.json();
+          const almaAnswer = j.answer || "⚠️ Erro a obter resposta do Alma Server.";
+
+          // Mostra no histórico como Avatar
+          addMessage("Avatar", almaAnswer);
+
+          // Faz o avatar falar
+          await avatar.speak({ text: almaAnswer });
         } catch (e) {
-          console.error("Falha no speak()", e);
+          console.error("Erro a contactar o Alma Server:", e);
+          addMessage("Avatar", "⚠️ Erro a contactar o Alma Server.");
         }
       });
 
-      // —— IMPORTANTE: não registamos AVATAR_* handlers nem triggers que façam o LLM interno falar ——
-
-      await startAvatar({
-        ...config,
-        // reforço para evitar agente interno por engano:
-        knowledgeId: undefined,
-      });
-
-      if (isVoiceChat) {
-        await startVoiceChat();
-      }
+      await startAvatar(config);
+      if (isVoiceChat) await startVoiceChat();
     } catch (error) {
       console.error("Error starting avatar session:", error);
     }
@@ -160,7 +114,7 @@ function InteractiveAvatar() {
         mediaStream.current!.play();
       };
     }
-  }, [mediaStream, stream]);
+  }, [stream]);
 
   return (
     <div className="w-full flex flex-col gap-4">
