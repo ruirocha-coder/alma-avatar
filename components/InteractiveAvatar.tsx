@@ -17,10 +17,9 @@ import { AvatarConfig } from "./AvatarConfig";
 import { AvatarVideo } from "./AvatarSession/AvatarVideo";
 import { useStreamingAvatarSession } from "./logic/useStreamingAvatarSession";
 import { AvatarControls } from "./AvatarSession/AvatarControls";
-import { useVoiceChat } from "./logic/useVoiceChat";
 import { StreamingAvatarProvider, StreamingAvatarSessionState } from "./logic";
 import { LoadingIcon } from "./Icons";
-import { MessageHistory, useMessageHistory } from "./AvatarSession/MessageHistory";
+import { MessageHistory } from "./AvatarSession/MessageHistory";
 
 import { AVATARS } from "@/app/lib/constants";
 
@@ -28,7 +27,7 @@ const DEFAULT_CONFIG: StartAvatarRequest = {
   quality: AvatarQuality.Low,
   avatarName: AVATARS[0].avatar_id,
   knowledgeId: undefined,
-  agent: undefined, // 👈 força a não usar o LLM interno do HeyGen
+  agent: undefined, // 👈 desliga o LLM interno do HeyGen
   voice: {
     rate: 1.2,
     emotion: VoiceEmotion.EXCITED,
@@ -44,8 +43,6 @@ const DEFAULT_CONFIG: StartAvatarRequest = {
 function InteractiveAvatar() {
   const { initAvatar, startAvatar, stopAvatar, sessionState, stream } =
     useStreamingAvatarSession();
-  const { startVoiceChat } = useVoiceChat();
-  const { addMessage } = useMessageHistory();
 
   const [config, setConfig] = useState<StartAvatarRequest>(DEFAULT_CONFIG);
 
@@ -59,45 +56,56 @@ function InteractiveAvatar() {
 
   const startSessionV2 = useMemoizedFn(async (isVoiceChat: boolean) => {
     try {
-      const newToken = await fetchAccessToken();
-      const avatar = initAvatar(newToken);
+      const token = await fetchAccessToken();
+      const avatar = initAvatar(token);
       avatarRef.current = avatar;
 
+      // — Eventos úteis de debug / histórico —
+      avatar.on(StreamingEvents.AVATAR_START_TALKING, (e) => {
+        console.log("Avatar started talking", e);
+      });
+      avatar.on(StreamingEvents.AVATAR_STOP_TALKING, (e) => {
+        console.log("Avatar stopped talking", e);
+      });
+      avatar.on(StreamingEvents.STREAM_DISCONNECTED, () => {
+        console.log("Stream disconnected");
+      });
       avatar.on(StreamingEvents.STREAM_READY, () => {
         console.log("✅ Stream ready");
-        avatar.interrupt(); // corta greeting automático
+        // Corta qualquer greeting automático
+        if (avatar.interrupt) avatar.interrupt();
       });
 
+      // Quando o utilizador termina uma frase (voz ou texto)
       avatar.on(StreamingEvents.USER_END_MESSAGE, async (event) => {
-        const userMsg = event.detail?.text;
-        if (!userMsg) return;
-
-        // Adiciona a fala do utilizador no histórico
-        addMessage("YOU", userMsg);
+        const userText = event?.detail?.text;
+        if (!userText) return;
 
         try {
           const r = await fetch("/api/alma", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question: userMsg }),
+            body: JSON.stringify({ question: userText }),
           });
 
           const j = await r.json();
-          const almaAnswer = j.answer || "⚠️ Erro a obter resposta do Alma Server.";
+          const almaAnswer = j?.answer || "⚠️ Erro a obter resposta do Alma Server.";
 
-          // Mostra no histórico como Avatar
-          addMessage("Avatar", almaAnswer);
-
-          // Faz o avatar falar
+          // Falar a resposta do Alma (isto também gera eventos AVATAR_* para o histórico)
           await avatar.speak({ text: almaAnswer });
         } catch (e) {
           console.error("Erro a contactar o Alma Server:", e);
-          addMessage("Avatar", "⚠️ Erro a contactar o Alma Server.");
+          await avatar.speak({ text: "⚠️ Erro a contactar o Alma Server." });
         }
       });
 
       await startAvatar(config);
-      if (isVoiceChat) await startVoiceChat();
+
+      // Se quiseres forçar início de captação de micro no arranque de Voice Chat,
+      // usa os controlos do demo (o botão de micro). Mantemos sem auto-start.
+      if (isVoiceChat) {
+        // opcional: chamar aqui algo como startVoiceChat() se tiveres essa função
+      }
     } catch (error) {
       console.error("Error starting avatar session:", error);
     }
@@ -126,6 +134,7 @@ function InteractiveAvatar() {
             <AvatarConfig config={config} onConfigChange={setConfig} />
           )}
         </div>
+
         <div className="flex flex-col gap-3 items-center justify-center p-4 border-t border-zinc-700 w-full">
           {sessionState === StreamingAvatarSessionState.CONNECTED ? (
             <AvatarControls />
@@ -139,6 +148,7 @@ function InteractiveAvatar() {
           )}
         </div>
       </div>
+
       {sessionState === StreamingAvatarSessionState.CONNECTED && <MessageHistory />}
     </div>
   );
